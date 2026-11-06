@@ -163,7 +163,8 @@ def get_job_information(url,log,exe_path):
         except Exception:
             pass
 
-def job_get():
+def job_get(exe_path):
+    """本地手动运行示例；需显式传入 Chrome/Edge 可执行文件路径。"""
     user_city = "北京"
     user_jobtype = "不限"
     user_salary = "不限"
