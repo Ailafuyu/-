@@ -7,7 +7,7 @@ from datetime import date
 from functools import lru_cache
 
 
-@lru_cache()
+@lru_cache(maxsize=8)
 def get_model(key,url,model,temperature):
     """获得语言大模型"""
     llm = ChatOpenAI(
@@ -64,18 +64,35 @@ def get_date():
 
 
 def get_resume_text2(resume_bytes):
-    """获得PDF简历文本（文本块）"""
-    docs = pymupdf.open("pdf",resume_bytes)
+    """Extract PDF text and fall back to optional local Tesseract OCR."""
+    if not resume_bytes:
+        raise ValueError("上传的 PDF 文件为空。")
+    document = pymupdf.open("pdf", resume_bytes)
     content = []
-    for doc in docs:
-        doc_text = doc.get_text().strip()
-        if doc_text:
-            doc_text = doc.get_text().replace(" ", "")
-            content.append(doc_text)
-    resume_text = "".join(content)
-    if not content:
-        resume_text="扫描结果为空，请重新上传 pdf。注意：pdf 需为具有文本块的 pdf，而非只有图片块。"
-    return resume_text
+    ocr_unavailable = False
+    try:
+        for page_number, page in enumerate(document, start=1):
+            page_text = page.get_text().strip()
+            if not page_text:
+                try:
+                    text_page = page.get_textpage_ocr(
+                        language="chi_sim+eng", dpi=200, full=True
+                    )
+                    page_text = page.get_text(textpage=text_page).strip()
+                except Exception:
+                    ocr_unavailable = True
+            if page_text:
+                content.append(f"\n--- 第 {page_number} 页 ---\n{page_text}")
+    finally:
+        document.close()
+    if content:
+        return "\n".join(content)
+    if ocr_unavailable:
+        return (
+            "未能提取 PDF 文本。该文件可能是扫描件；请安装 Tesseract OCR，"
+            "并配置 chi_sim 与 eng 语言包后重试，或上传可复制文字的 PDF。"
+        )
+    return "PDF 中未发现可提取的文本内容，请检查文件是否有效。"
 
 
 def get_resume_refine(resume_text,key,url,model="gpt-5-mini-2025-08-07"):
@@ -615,57 +632,4 @@ def get_ai_response(user_input,report,key,url,model):
     ai_response=response.content
     return ai_response
 
-
-def get_resume_portrait_keywords():
-    key = "sk-live-kmwPsO1yz9kJfbp8c6az72I-BjfZBX-5V5CmI9yTsXw"
-    url = "https://api.modelbest.cn/v1"
-    model = "MiniCPM-O-4.5-9B"
-    resume_path="resume.pdf"
-    doc = pymupdf.open(resume_path)
-    resume_bytes = doc.tobytes()
-    resume_text = get_resume_text2(resume_bytes)
-    print(resume_text)
-    resume_refine = get_resume_refine(resume_text,key,url,model)
-    print(resume_refine)
-    answers="=== 用户职业倾向评估问卷结果 === 【第一部分：职业目标】 问题1：未来3-5年，你希望自己的职业状态更接近哪一种？回答：成为某个领域的专业人才 问题2：你目前最希望从工作中获得什么？（最多选择3项）回答：持续学习和能力提升,更大的自主权,更多创造和探索机会 问题3：如果未来长期从事一种类型的工作，你更倾向？回答：发现机会并创造新的方向 【第二部分：工作方式偏好】 问题4：你更喜欢怎样解决问题？回答：独立分析，深入思考后解决 问题5：你更享受哪类工作成果？回答：创造新的知识或方法 问题6：你的理想工作节奏更接近？回答：高自由度、自主安排 【第三部分：组织环境偏好】 问题7：你更喜欢什么类型的组织环境？回答：小团队，高自由度 问题8：你希望自己在组织中的角色更偏向？回答：核心骨干 问题9：你更喜欢？回答：多领域交叉，解决综合问题 【第四部分：行业和方向偏好】 问题10：选择未来发展方向时，你更看重？回答：完全转向新的兴趣方向 问题11：你更愿意在哪类问题中发挥价值？回答：技术创新问题 问题12：你希望未来的职业标签更接近？回答：解决方案提供者 【第五部分：现实约束】 问题13：你的工作地点偏好是什么？（可多选）回答：发,现,机,会,并,创,造,新,的,方,向 问题14：选择工作机会时，你更看重？（多选，先选的最重要）回答：工作兴趣,工作生活平衡,发展空间,薪资水平,公司品牌,工作稳定性 问题15：你明确不希望从事哪些类型的工作？回答：高频重复工作,强销售性质,高压力竞争环境 其他明确不希望从事的工作类型？（选填）回答：禁止思想"
-    json_portrait=get_json_portrait(resume_refine,answers,key,url,model)
-    print(json_portrait)
-    report = get_report(json_portrait,key,url,model)
-    print(report)
-    keywork = get_keywork(json_portrait,key,url,model)
-    print(keywork)
-    user_input="你有我的信息吗"
-    report="""
-    一、职业定位 该人才具备能源系统设计、工艺仿真与能效评估的研究型工程背景。以综合能源系统仿真和多能源互补为核心，结合数据分析与AI应用开发能力，能够将研究落地成工程方案。未来发展将聚焦成为领域内的专业技术实现者，在资源充足、流程成熟的平台深耕与落地。
-
-    二、核心竞争优势
-    
-    能源系统设计与工艺仿真的综合能力：熟练使用Aspen Plus等工具，提升设计可行性。
-    跨领域专利与论文产出经验：具备知识产权化意识与科研传播能力。
-    数据驱动与AI应用开发能力：掌握Python、LangChain、RAG等核心技术，能转化为实用解决方案。
-    多能源互补与前沿工艺创新背景：在超临界CO2发电等方向具备落地潜力。
-    三、能力结构
-    
-    技术能力
-    掌握能源系统设计、工艺仿真与能效评估的关键工具，熟悉Aspen Plus、Aspen Energy Analyzer，具备Python数据分析与信息抓取技能，能够完成数据提取、清洗及对比分析。
-    
-    专业能力
-    具备离子液体分离、工艺优化、超临界CO2发电、多能源互补的研究背景，具备可行性研究、经济性评估及专利/论文撰写经验，熟悉跨学科协作流程。
-    
-    综合能力
-    具备跨领域协作、问题解决与方案设计能力，能够将科研成果转化为工程落地，具备一定的技术传播与知识产权化经验。
-    
-    四、职业特点 该人才通常适合在资源丰富、流程成熟的平台进行深入研究与技术创新；倾向独立分析、数据驱动的工作方式，偏向专业执行与技术实现。通常能够在小到中型项目中担任核心技术负责人，推动跨学科协作与落地。
-    
-    五、发展建议
-    
-    继续积累工程落地经验，提升设计落地性与实际效益。
-    加强经济性评估、成本控制与项目管理的系统训练。
-    深化专利与学术成果的转化路径，提升知识产权化能力。
-    强化产业场景意识，积累更多产业化原型落地案例。"""
-    ai_response=get_ai_response(user_input,report,key,url,model)
-    print(ai_response)
-
-if __name__ == "__main__":
-    get_resume_portrait_keywords()
 
