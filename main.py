@@ -922,7 +922,7 @@ with tab2:
             else:
                 try:
                     st.session_state.resume_refine = get_resume_refine(st.session_state.resume_text,key,url,refine_llm)
-                except:
+                except Exception:
                     st.session_state.resume_refine = "请检查key、url、简历精炼模型是否输入正确。"
                     st.session_state.json_portrait = "请检查key、url、简历精炼模型是否输入正确。"
                     st.session_state.user_report = "请检查key、url、简历精炼模型是否输入正确。"
@@ -940,7 +940,7 @@ with tab3:
         with st.spinner("JSON 画像正在生成，请稍等..."):
             try:
                 st.session_state.json_portrait = get_json_portrait(st.session_state.resume_refine, user_profile_string,key,url,portrait_llm)
-            except:
+            except Exception:
                 st.session_state.json_portrait="请检查key、url、画像生成模型是否输入正确。"
                 st.session_state.user_report = "请检查key、url、画像生成模型是否输入正确。"
                 st.session_state.keywork = "请检查key、url、画像生成模型是否输入正确。"
@@ -957,7 +957,7 @@ with tab4:
         with st.spinner("职场报告正在生成，请稍等..."):
             try:
                 st.session_state.user_report = get_report(st.session_state.json_portrait,key,url,report_llm)
-            except:
+            except Exception:
                 st.session_state.user_report = "请检查key、url、报告生成模型是否输入正确。"
                 st.session_state.keywork = "请检查key、url、报告生成模型是否输入正确。"
             st.write(st.session_state.user_report)
@@ -973,7 +973,7 @@ with tab5:
         with st.spinner("检索词正在生成，请稍等..."):
             try:
                 st.session_state.keywork = get_keywork(st.session_state.json_portrait,key,url,keywork_llm)
-            except:
+            except Exception:
                 st.session_state.keywork = "请检查key、url、检索词生成模型是否输入正确。"
             st.write(st.session_state.keywork)
             st.markdown('</div>', unsafe_allow_html=True)
@@ -1009,7 +1009,7 @@ if question:
     with st.spinner("聊天喵正在思考，请稍等..."):
         try:
             response = get_ai_response(question, st.session_state.user_report,key, url,ai_llm)
-        except:
+        except Exception:
             response = "请检查key、url、ai聊天模型是否输入正确喵。"
     msg = {"role": "ai", "content": response}
     st.session_state["messages"].append(msg)
