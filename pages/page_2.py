@@ -668,16 +668,25 @@ if submit:
         errors.append("- 岗位 JSON 文件")
     if not json_profile.strip():
         errors.append("- JSON 画像")
-    if "Rag分析" in analysis_choice:
-        if not db_key:
-            errors.append("- 向量库 API Key ")
-        if not db_url:
-            errors.append("- 向量库 API URL ")
-        if not db_model:
-            errors.append("- 向量库模型")
-        if uploaded_file:
+    if uploaded_file:
+        try:
             content = uploaded_file.getvalue().decode("utf-8")
             datas = json.loads(content)
+            if not isinstance(datas, list):
+                errors.append("- 岗位 JSON 顶层必须是数组")
+            elif not all(isinstance(item, dict) for item in datas):
+                errors.append("- 岗位 JSON 中的每条记录都必须是对象")
+            elif not datas:
+                errors.append("- 岗位 JSON 中没有岗位记录")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            errors.append("- 岗位 JSON 文件格式无效，请检查编码和 JSON 语法")
+    if "Rag" in analysis_choice:
+        if not db_key:
+            errors.append("- 向量库 API Key")
+        if not db_url:
+            errors.append("- 向量库 API URL")
+        if not db_model:
+            errors.append("- 向量库模型")
 
     if errors:
         st.error(
@@ -751,6 +760,9 @@ def clean_df(df):
         "development_value"
     ]
 
+    missing_cols = [col for col in score_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError("岗位评分结果缺少字段：" + ", ".join(missing_cols))
     for col in score_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
     df["ability_match"] = df["ability_match"].clip(0, 35)
