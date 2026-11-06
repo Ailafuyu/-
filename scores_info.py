@@ -287,15 +287,14 @@ def process_single_job1(task):
 def process_single_job2(task):
     """单条岗位的处理逻辑（带二次重试机制），作为线程池的执行任务"""
     index, job_info, key, url, model, json_profile=task
-    job_info = job_info.page_content
+    job_info = json.loads(job_info.page_content)
+    if not isinstance(job_info, dict):
+        raise ValueError("检索到的岗位数据必须是 JSON 对象。")
     numb = index + 1
     print(f"正在给第 {numb} 条岗位打分")
     attempt_max=3
     for attempt in range(1, attempt_max + 1):
         try:
-            job_info = json.loads(job_info)
-            if not isinstance(job_info, dict):
-                raise ValueError("检索到的岗位数据必须是 JSON 对象。")
             response = get_job_score(key, url, model, job_info, json_profile)
             result = _normalize_score_result(_parse_model_json(response))
             return job_info | result
