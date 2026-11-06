@@ -877,7 +877,7 @@ if single_info:
 
             st.markdown("#### 🚀 发展价值")
             st.success(job["发展建议"])
-    except:
+    except Exception:
         with tab1:
             st.error("请检查，公司名或岗位名称是否输入正确")
         with tab2:

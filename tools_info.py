@@ -11,18 +11,27 @@ def get_data(files):
         if isinstance(file, str):
             with open(file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                datas.extend(data)
         else:
+            if hasattr(file, "seek"):
+                file.seek(0)
             data = json.load(file)
-            datas.extend(data)
+        if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+            raise ValueError("每个岗位文件都必须是由 JSON 对象组成的数组。")
+        datas.extend(data)
     return datas
 
 def concat_files(files,hr_select):
     """获得去重/筛选后的字典列表"""
-    datas=get_data(files)
-    datas=pd.DataFrame(datas)
-    datas_rows=len(datas)
-    new_datas=datas.drop_duplicates(subset=['公司名称','职位名称','薪资'])
+    datas = get_data(files)
+    if not datas:
+        raise ValueError("上传文件中没有可处理的岗位数据。")
+    datas = pd.DataFrame(datas)
+    required = ["公司名称", "职位名称", "薪资"]
+    missing = [column for column in required if column not in datas.columns]
+    if missing:
+        raise ValueError("岗位数据缺少必要字段：" + ", ".join(missing))
+    datas_rows = len(datas)
+    new_datas = datas.drop_duplicates(subset=required)
     new_datas_rows=len(new_datas)
     if hr_select=="开启 HR 活跃度筛选":
         discard_list = ['半年前活跃','5月内活跃','4月内活跃','3月内活跃','2月内活跃','近半年活跃',]
@@ -39,7 +48,7 @@ def concat_files(files,hr_select):
 def parse_salary(salary):
     """将薪资统一转换成：salary_min：最低月薪（元），salary_max：最高月薪（元）"""
 
-    if pd.isna(salary):
+    if salary is None or (not isinstance(salary, (list, dict)) and pd.isna(salary)):
         return np.nan, np.nan
 
     salary = str(salary)
@@ -76,17 +85,27 @@ def parse_salary(salary):
 
 def get_analysis_df(file):
     if isinstance(file, str):
-        df = pd.read_json(file)
+        with open(file, "r", encoding="utf-8") as source:
+            analysis_data = json.load(source)
     else:
+        if hasattr(file, "seek"):
+            file.seek(0)
         analysis_data = json.load(file)
-        df=pd.DataFrame(analysis_data)
+    if not isinstance(analysis_data, list):
+        raise ValueError("分析文件必须是 JSON 数组。")
+    df = pd.DataFrame(analysis_data)
+    if "薪资" not in df.columns:
+        raise ValueError("分析文件缺少“薪资”字段。")
     df[["最低薪资", "最高薪资"]] = df["薪资"].apply(lambda x: pd.Series(parse_salary(x)))
     return df
 
 
 def get_top50_df(file):
-    analysis_df=get_analysis_df(file)
-    top50_df=analysis_df.sort_values("总得分", ascending=False).head(50).reset_index(drop=True)
+    analysis_df = get_analysis_df(file)
+    if "总得分" not in analysis_df.columns:
+        raise ValueError("分析文件缺少“总得分”字段。")
+    analysis_df["总得分"] = pd.to_numeric(analysis_df["总得分"], errors="coerce")
+    top50_df = analysis_df.sort_values("总得分", ascending=False, na_position="last").head(50).reset_index(drop=True)
     top50_df.index = top50_df.index + 1
     return top50_df
 

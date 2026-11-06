@@ -3,6 +3,7 @@ import time
 from random import randint
 import re
 import json
+from urllib.parse import urlencode
 
 
 def get_detail_info(browser,job):
@@ -20,10 +21,10 @@ def get_detail_info(browser,job):
     else:
         brand_des = "缺失"
 
-    brand_time_ele = tab2.ele('xpath://li[@class="res-time"]')                  # 获取公司成立日期
+    brand_time_ele = tab2.ele('xpath://li[@class="res-time"]')
     if brand_time_ele:
-        brand_time = brand_time_ele.text
-        brand_time = re.findall("成立日期(.*)",brand_time)[0]
+        match = re.search(r"成立日期(.*)", brand_time_ele.text)
+        brand_time = match.group(1).strip() if match else brand_time_ele.text.strip()
     else:
         brand_time = "缺失"
 
@@ -106,10 +107,21 @@ def get_url(user_city,user_jobtype,user_salary,user_experience,user_degree,user_
     experience={"不限":"","在校生":"&experience=108","应届生":"&experience=102","经验不限":"&experience=101"}
     degree={"不限":"","大专":"&degree=202","本科":"&degree=203","硕士":"&degree=204"}
     scale={"不限":"","0-20人":"&scale=301","20-99人":"&scale=302","100-499人":"&scale=303"}
+    if user_city not in city:
+        raise ValueError(f"暂不支持城市：{user_city}")
+    if user_jobtype not in jobtype or user_salary not in salary:
+        raise ValueError("岗位类型或薪资筛选条件无效。")
+    if user_experience not in experience or user_degree not in degree or user_scale not in scale:
+        raise ValueError("经验、学历或公司规模筛选条件无效。")
+    params = "&".join(
+        part for part in (
+            city[user_city], jobtype[user_jobtype], salary[user_salary],
+            experience[user_experience], degree[user_degree], scale[user_scale],
+        ) if part
+    )
     if user_query:
-        user_query=f"&query={user_query}"
-    url="https://www.zhipin.com/web/geek/jobs?"+city[user_city]+jobtype[user_jobtype]+salary[user_salary]+experience[user_experience]+degree[user_degree]+scale[user_scale]+user_query
-    return url
+        params += "&" + urlencode({"query": user_query})
+    return "https://www.zhipin.com/web/geek/jobs?" + params
 
 def get_job_information(url,log,exe_path):
     co = ChromiumOptions().set_browser_path(fr"{exe_path}")
@@ -119,24 +131,40 @@ def get_job_information(url,log,exe_path):
     tab1.get(url)
 
     jobs_info=[]
-    for page in range(1,50):
-        log(f"正在采集第{page}页，当前已爬取岗位数: {len(jobs_info)}")
-        resp = tab1.listen.wait(timeout=5)
-        if not resp:
-            log(f"【提示】超时未捕获到新数据包，说明当前可能已无更多数据，岗位采集结束。")
-            log(f"已爬取岗位数: {len(jobs_info)}")
-            break
-        json_data=resp.response.body
-        job_list=json_data['zpData']['jobList']
-        for job in job_list:
-            job_info = get_total_info(browser,job)
-            jobs_info.append(job_info)
-            log(f"{job_info['公司名称']}的{job_info['职位名称']}岗位爬取成功")
-        tab1.scroll.to_bottom()
-    return jobs_info
-    #save_to_json(jobs_info,user_query)
+    try:
+        for page in range(1, 50):
+            log(f"正在采集第{page}页，当前已爬取岗位数: {len(jobs_info)}")
+            resp = tab1.listen.wait(timeout=5)
+            if not resp:
+                log("【提示】超时未捕获到新数据包，可能已无更多数据，岗位采集结束。")
+                break
+            response_body = resp.response.body
+            try:
+                job_list = response_body["zpData"]["jobList"]
+            except (KeyError, TypeError):
+                log("【错误】招聘网站返回的数据结构发生变化，已停止采集。")
+                break
+            if not job_list:
+                log("当前页面没有岗位数据，采集结束。")
+                break
+            for job in job_list:
+                try:
+                    job_info = get_total_info(browser, job)
+                    jobs_info.append(job_info)
+                    log(f"{job_info['公司名称']}的{job_info['职位名称']}岗位爬取成功")
+                except Exception as exc:
+                    log(f"岗位详情采集失败，已跳过：{type(exc).__name__}")
+            tab1.scroll.to_bottom()
+        log(f"已爬取岗位数: {len(jobs_info)}")
+        return jobs_info
+    finally:
+        try:
+            browser.quit()
+        except Exception:
+            pass
 
-def job_get():
+def job_get(exe_path):
+    """本地手动运行示例；需显式传入 Chrome/Edge 可执行文件路径。"""
     user_city = "北京"
     user_jobtype = "不限"
     user_salary = "不限"
@@ -145,8 +173,8 @@ def job_get():
     user_scale = "不限"
     user_query = "大模型"
 
-    url=get_url(user_city, user_jobtype, user_salary, user_experience, user_degree, user_scale, user_query)
-    get_job_information(url,user_query)
+    url = get_url(user_city, user_jobtype, user_salary, user_experience, user_degree, user_scale, user_query)
+    return get_job_information(url, print, exe_path)
 
 if __name__ == "__main__":
-    job_get()
+    print("请在 Python 中调用 job_get(exe_path)，并传入本机 Chrome/Edge 可执行文件路径。")

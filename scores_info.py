@@ -1,4 +1,6 @@
 import json
+import math
+import re
 from langchain_core.documents import Document
 from langchain_openai.embeddings import OpenAIEmbeddings
 from pydantic import SecretStr
@@ -11,17 +13,20 @@ import concurrent.futures
 
 def load_json_docs(file):
     """获得json切片文档"""
-    if isinstance(file, str):            # 文件路径
-        with open(file, "r", encoding="utf-8") as f:
-            datas = json.load(f)
+    if isinstance(file, str):
+        with open(file, "r", encoding="utf-8") as source:
+            datas = json.load(source)
     else:
-        datas = json.load(file)          # 文件对象
+        if hasattr(file, "seek"):
+            file.seek(0)
+        datas = json.load(file)
+    if not isinstance(datas, list):
+        raise ValueError("岗位数据必须是 JSON 数组。")
     documents = []
-    for data in datas:
-        doc = Document(
-            page_content=str(data),
-        )
-        documents.append(doc)
+    for index, data in enumerate(datas):
+        if not isinstance(data, dict):
+            raise ValueError(f"第 {index + 1} 条岗位数据必须是 JSON 对象。")
+        documents.append(Document(page_content=json.dumps(data, ensure_ascii=False)))
     return documents
 
 
@@ -43,7 +48,7 @@ def get_retriever(texts,db_key,db_url,db_model):
     return retriever
 
 
-@lru_cache()
+@lru_cache(maxsize=8)
 def get_model(key,url,model,temperature):
     """获得语言大模型"""
     llm = ChatOpenAI(
@@ -120,21 +125,21 @@ def get_job_score(key, url, model,job_info,json_profile):
     ==================================================
     ## 2. 工作职责匹配（responsibility_match，满分25分）
     评价：候选人过去经历是否能够支撑岗位主要职责。
-    取值范围：0 <= ability_match <= 25
+    取值范围：0 <= responsibility_match <= 25
     ==================================================
     ## 3. 职业方向匹配（career_match，满分20分）
     评价：
     岗位是否符合：长期职业规划、职业目标、未来发展方向
-    取值范围：0 <= ability_match <= 20
+    取值范围：0 <= career_match <= 20
     ==================================================
     ## 4. 背景条件匹配（background_match，满分10分）
     评价：学历、专业、工作经验、行业背景
-    取值范围：0 <= ability_match <= 10
+    取值范围：0 <= background_match <= 10
     ==================================================
     ## 5. 岗位发展价值（development_value，满分10分）
     评价：
     岗位是否能够：提升能力、增加职业竞争力、提供成长空间、提升长期职业价值
-    取值范围：0 <= ability_match <= 10
+    取值范围：0 <= development_value <= 10
     ==================================================
     综合得分计算方式：
     match_score =ability_match +responsibility_match +career_match +background_match +development_value
@@ -211,6 +216,53 @@ def get_job_score(key, url, model,job_info,json_profile):
     return response.content
 
 
+
+_SCORE_LIMITS = {
+    "ability_match": 35,
+    "responsibility_match": 25,
+    "career_match": 20,
+    "background_match": 10,
+    "development_value": 10,
+}
+
+
+def _parse_model_json(response):
+    """Parse a JSON object returned by the model, tolerating Markdown fences."""
+    if not isinstance(response, str):
+        raise ValueError("模型返回内容不是文本。")
+    cleaned = response.strip()
+    cleaned = re.sub(r"^\s*```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+    try:
+        result = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("模型没有返回有效的 JSON 对象。")
+        result = json.loads(cleaned[start:end + 1])
+    if not isinstance(result, dict):
+        raise ValueError("模型返回的 JSON 顶层必须是对象。")
+    return result
+
+
+def _normalize_score_result(result):
+    """Validate score fields, clamp them to their rubric, and recompute total."""
+    normalized = dict(result)
+    for field, maximum in _SCORE_LIMITS.items():
+        value = normalized.get(field)
+        if isinstance(value, bool):
+            raise ValueError(f"评分字段 {field} 必须是数字。")
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"评分字段 {field} 必须是数字。")
+        if not math.isfinite(value):
+            raise ValueError(f"评分字段 {field} 必须是有限数字。")
+        normalized[field] = min(max(value, 0.0), float(maximum))
+    normalized["match_score"] = round(sum(normalized[field] for field in _SCORE_LIMITS), 2)
+    return normalized
+
+
 def process_single_job1(task):
     """单条岗位的处理逻辑（带二次重试机制），作为线程池的执行任务"""
     index, job_info, key, url, model, json_profile=task
@@ -219,10 +271,11 @@ def process_single_job1(task):
     attempt_max=3
     for attempt in range(1, attempt_max + 1):
         try:
+            if not isinstance(job_info, dict):
+                raise ValueError("岗位数据必须是 JSON 对象。")
             response = get_job_score(key, url, model, job_info, json_profile)
-            response = response.replace("```json", "").replace("```", "")
-            res = json.loads(response)
-            return job_info | res
+            result = _normalize_score_result(_parse_model_json(response))
+            return job_info | result
         except Exception:
             if attempt < attempt_max:
                 print(f"⚠️ 第 {numb} 条岗位第 {attempt} 次处理失败，正在重试...")
@@ -234,18 +287,17 @@ def process_single_job1(task):
 def process_single_job2(task):
     """单条岗位的处理逻辑（带二次重试机制），作为线程池的执行任务"""
     index, job_info, key, url, model, json_profile=task
-    job_info = job_info.page_content
+    job_info = json.loads(job_info.page_content)
+    if not isinstance(job_info, dict):
+        raise ValueError("检索到的岗位数据必须是 JSON 对象。")
     numb = index + 1
     print(f"正在给第 {numb} 条岗位打分")
     attempt_max=3
     for attempt in range(1, attempt_max + 1):
         try:
             response = get_job_score(key, url, model, job_info, json_profile)
-            response = response.replace("```json", "").replace("```", "")
-            res = json.loads(response)
-            job_info = job_info.replace("'", '"')
-            job_info = json.loads(job_info)
-            return job_info | res
+            result = _normalize_score_result(_parse_model_json(response))
+            return job_info | result
         except Exception:
             if attempt < attempt_max:
                 print(f"⚠️ 第 {numb} 条岗位第 {attempt} 次处理失败，正在重试...")
@@ -264,18 +316,19 @@ def scores_total(uploaded_file, json_profile, key, url, model,log):
         with open(uploaded_file, "r", encoding="utf-8") as f:
             docs = json.load(f)
     else:
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
         docs = json.load(uploaded_file)
-    new_job_infos = []
+    if not isinstance(docs, list) or not all(isinstance(item, dict) for item in docs):
+        raise ValueError("岗位文件必须是由 JSON 对象组成的数组。")
     tasks = [(index, job_info, key, url, model, json_profile) for index, job_info in enumerate(docs)]
-    numb=1
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        responses = [executor.submit(process_single_job1, task) for task in tasks]
-        for response in concurrent.futures.as_completed(responses):
-            response = response.result()
-            log(f"已分析完{numb}条岗位")
-            numb=numb+1
-            if response is not None:
-                new_job_infos.append(response)
+    results = [None] * len(tasks)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, max(1, len(tasks)))) as executor:
+        futures = {executor.submit(process_single_job1, task): task[0] for task in tasks}
+        for completed, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+            results[futures[future]] = future.result()
+            log(f"已分析完{completed}条岗位")
+    new_job_infos = [item for item in results if item is not None]
     log(f"分析已完成，共分析{len(new_job_infos)}条岗位信息")
     return new_job_infos
 
@@ -284,49 +337,17 @@ def scores_rag(db_key,db_url,db_model,uploaded_file,json_profile,key,url,model,l
     docs=load_json_docs(uploaded_file)
     retriever=get_retriever(docs,db_key,db_url,db_model)
     retrieved_docs=retriever.invoke(json_profile)
-    new_job_infos = []
-    numb = 1
     tasks = [(index, job_info, key, url, model, json_profile) for index, job_info in enumerate(retrieved_docs)]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        responses = [executor.submit(process_single_job2, task) for task in tasks]
-        for response in concurrent.futures.as_completed(responses):
-            response = response.result()
-            log(f"已分析完{numb}条岗位")
-            numb = numb + 1
-            if response is not None:
-                new_job_infos.append(response)
-    return new_job_infos
+    results = [None] * len(tasks)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, max(1, len(tasks)))) as executor:
+        futures = {executor.submit(process_single_job2, task): task[0] for task in tasks}
+        for completed, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+            results[futures[future]] = future.result()
+            log(f"已分析完{completed}条岗位")
+    new_job_infos = [item for item in results if item is not None]
     log(f"分析已完成，共分析{len(new_job_infos)}条岗位信息")
     return new_job_infos
 
 
 
-
-def train_rag():
-    db_key ="sk-JrfN4hxZOKE4Zs7b6M5jYQnBsz0TsM7vGgtSyDXnIpav5Ptm"
-    db_url = "https://aigc789.top/v1"
-    db_model="text-embedding-3-large"
-    file_path="能源大模型应用开发.json"
-    key = "sk-JrfN4hxZOKE4Zs7b6M5jYQnBsz0TsM7vGgtSyDXnIpav5Ptm"
-    url = "https://aigc789.top/v1"
-    model="gpt-5-nano-2025-08-07"
-    json_profile = '{ "basic_profile": { "career_identity": "能源系统与工艺仿真+数据/AI交叉的技术型人才（偏个人贡献者）", "career_stage": "早期-成长阶段（硕士毕业约1年+，完成科研与工程项目落地）", "one_sentence_summary": "具备综合能源系统与工艺仿真背景，能将爬虫与RAG智能体等数据/AI方法用于工程信息获取与方案优化，偏好在小团队解决复杂技术问题并做出突破。" }, "education_background": { "highest_degree": "硕士", "major_field": "动力工程（综合能源系统仿真）", "universities": [ "华北电力大学（硕士）", "东北电力大学（本科）" ], "education_summary": "硕士阶段聚焦综合能源系统仿真与优化，本科为能源与动力工程；期间发表SCI论文2篇、授权专利2项（其中实用新型第一作者、发明第二作者），通过CET-6。", "relevant_knowledge": [ "综合能源系统建模与优化（多能互补、园区能源）", "工艺流程模拟（Aspen Plus、Aspen Energy Analyzer）", "能效/经济性/环境可持续性多维评价", "超临界CO2发电、Power-to-Gas相关原理与系统设计", "Python数据分析（numpy、pandas、matplotlib、seaborn）", "爬虫与自动化（XPath、selenium、JS加密逆向）", "AI应用开发（langchain、RAG、Agent）", "科研写作与专利挖掘" ] }, "work_experience": { "total_years": "约1.5年", "experiences": [ { "company": "北京华电能源互联网研究院有限公司", "position": "科研助理", "industry": "能源电力/科研", "period": "2023-072024-07", "responsibilities": [ "参与能源系统相关课题研究与技术方案论证", "协助撰写能源电力系统领域发明专利" ], "achievements": [ "协助完成发明专利4项（已提交/授权，以协作者身份）" ], "technologies": [ "综合能源系统建模思路", "专利撰写流程与技术交底" ] }, { "company": "WOOD中国宁夏分公司", "position": "热工助理工程师", "industry": "工程设计/能源", "period": "2025-072026-01", "responsibilities": [ "按业主要求开展能源系统方案设计与论证", "参与可行性研究与基础设计文件编制" ], "achievements": [ "完成可行性研究2项、基础设计2项并交付" ], "technologies": [ "能源系统方案设计方法", "可研/初设编制流程" ] } ], "career_summary": "路径由科研走向工程实践：研究院期间积累能源系统技术研究与专利协作能力，随后在工程公司完成从需求到可研/初设的工程化交付。期间并行发展数据/AI与爬虫能力，形成“工艺仿真+数据智能”的交叉能力结构。" }, "core_competencies": [ { "name": "工艺仿真与流程优化（Aspen Plus/AEA）", "level": "高级", "evidence": "在离子液体精馏工艺研究中提出两套方案并进行严格模拟，对能效/经济/环境进行对比评估；发表SCI论文2篇。" }, { "name": "综合能源系统方案设计与评估", "level": "中高级", "evidence": "园区多能互补运行优化研究，设计3种工作模式（含超临界CO2与电制天然气），授权发明专利1项；工程端完成2项可研与2项初设。" }, { "name": "Python数据分析与AI应用开发（RAG/Agent）", "level": "中高级", "evidence": "自研爬虫+AI+数据分析一体化智能体（岗位推荐、博导匹配、公众号要点汇总）；掌握langchain、RAG、Agent、numpy/pandas。" }, { "name": "爬虫与逆向工程", "level": "中级", "evidence": "掌握XPath、selenium与JS加密逆向，完成多源信息抓取以支撑智能体与分析任务。" }, { "name": "多目标技术经济-环境评估", "level": "中高级", "evidence": "在工艺研究中同时评估能效、经济性与环境影响，形成系统性对比分析结论。" }, { "name": "项目执行与工程交付", "level": "中级", "evidence": "在工程公司按业主要求完成可研与基础设计交付，具备从需求到文档产出的执行能力。" }, { "name": "专利与科研写作", "level": "中级", "evidence": "第一作者实用新型专利1项（已授权）、第二作者发明专利1项（已授权），并协助4项发明专利；SCI论文2篇。" }, { "name": "技术传播与影响力", "level": "中级", "evidence": "自媒体累计阅读42万+、互动9400+，具备将技术内容转化为受众可理解信息的能力。" }, { "name": "英语技术阅读/写作", "level": "中级", "evidence": "SCI论文发表与CET-6通过。" } ], "experience_analysis": { "valuable_experience": [ "将离子液体精馏新工艺进行严谨建模、仿真与多维度评价，体现从概念到可比选方案的端到端能力。", "园区综合能源系统（含超临界CO2与P2G）的运行策略设计与模式划分，体现系统级建模与优化思路，并产出发明专利。", "在工程公司完成可行性研究和基础设计，探索科研成果向工程交付的转化路径，理解业主需求与合规流程。", "自研爬虫+RAG智能体提升信息收集与知识组织效率，显示跨领域技术组合与快速原型能力。", "在研究院参与专利撰写与技术交底，形成知识产权意识与方法。" ], "transferable_skills": [ "复杂系统问题分解与建模能力（可迁移至多种流程工业与能源项目）", "多目标权衡与定量评估（能效/经济/环境），适用于技术选型与决策支持", "数据获取自动化与知识工程（爬虫+RAG），可迁移至信息密集型业务", "技术文档与专利写作，适用于方案呈现与知识沉淀", "从需求到交付的项目执行能力，适用于咨询、工程与产品实施场景", "跨学科协同与快速学习能力，适合新技术引入与迭代" ] }, "technical_business_profile": { "technical_capability": "强，侧重工艺仿真与综合能源系统设计，兼具Python数据分析、爬虫与RAG/Agent开发能力，擅长多目标技术经济评估。", "business_capability": "中等偏初，能够理解业主需求并转化为可研/初设交付，对成本、能效与合规性有基本把握，具备技术方案呈现与影响力传播能力。", "management_capability": "初级，适合作为小团队/课题核心骨干承担关键技术模块，当前更偏个人贡献者角色。" }, "career_preferences": { "preferred_work": [ "解决复杂问题与技术难题", "技术创新与跨领域探索", "高自由度的研究/开发与自主安排的工作节奏", "以数据与模型驱动的设计优化与决策支持", "从信息获取到方案输出的端到端任务" ], "preferred_environment": [ "小团队、高自由度的组织氛围", "多学科交叉、开放创新的环境", "注重技术深度与实质价值产出的文化" ], "preferred_role_style": [ "核心骨干型个人贡献者", "独立分析、深入思考后解决问题", "偏技术路线而非管理路线（当前阶段）" ] }, "career_motivation": { "main_drivers": [ "技术成长与持续学习", "创造与探索空间", "自主性与高自由度", "工作兴趣匹配", "发展空间", "工作生活平衡" ] }, "career_constraints": { "avoid_roles": [ "高频重复工作", "高压力竞争环境", "强销售性质岗位", "缺乏实际意义的工作" ], "avoid_environment": [ "强KPI与高压竞争文化", "以销售业绩为主导的团队", "流程繁复、个人自主性低的大型组织（相对不偏好）" ], "limitations": [ "总体工作年限约1.5年，完整项目全周期与大规模工程化实践仍需积累", "AI/数据产品的生产级工程化与落地经验有待进一步验证（目前以项目原型为主）", "工作地点偏好：信息不足，需要进一步确认（问卷第13题未提供有效地点信息）" ] }, "professional_profile_summary": "用户是具备综合能源系统与工艺仿真优势、并能将数据/AI方法（爬虫、RAG/Agent）应用于工程信息化与决策支持的交叉型工程人才。其竞争力在于将模型与数据结合，完成从信息获取、仿真分析到技术经济-环境多维评估的闭环；偏好小团队高自由度环境，愿作为核心骨干攻坚复杂技术问题。短板在于工程化规模与生产级AI落地经验尚需积累。适合的发展方向包括：工艺/能源系统仿真与优化工程师、综合能源系统设计与优化工程师、能源数字化/工业AI应用工程师、工艺数据科学家/工业软件应用工程师、碳管理/能效评估咨询等，这些方向兼顾其既有能力、创新偏好与长期成长潜力。" }'
-    new_job_infos=scores_rag(db_key,db_url,db_model,file_path,json_profile,key,url,model)
-    save_to_json(new_job_infos)
-
-def train_tatol():
-    file_path = "能源大模型应用开发.json"
-    json_profile = '{ "basic_profile": { "career_identity": "能源系统与工艺仿真+数据/AI交叉的技术型人才（偏个人贡献者）", "career_stage": "早期-成长阶段（硕士毕业约1年+，完成科研与工程项目落地）", "one_sentence_summary": "具备综合能源系统与工艺仿真背景，能将爬虫与RAG智能体等数据/AI方法用于工程信息获取与方案优化，偏好在小团队解决复杂技术问题并做出突破。" }, "education_background": { "highest_degree": "硕士", "major_field": "动力工程（综合能源系统仿真）", "universities": [ "华北电力大学（硕士）", "东北电力大学（本科）" ], "education_summary": "硕士阶段聚焦综合能源系统仿真与优化，本科为能源与动力工程；期间发表SCI论文2篇、授权专利2项（其中实用新型第一作者、发明第二作者），通过CET-6。", "relevant_knowledge": [ "综合能源系统建模与优化（多能互补、园区能源）", "工艺流程模拟（Aspen Plus、Aspen Energy Analyzer）", "能效/经济性/环境可持续性多维评价", "超临界CO2发电、Power-to-Gas相关原理与系统设计", "Python数据分析（numpy、pandas、matplotlib、seaborn）", "爬虫与自动化（XPath、selenium、JS加密逆向）", "AI应用开发（langchain、RAG、Agent）", "科研写作与专利挖掘" ] }, "work_experience": { "total_years": "约1.5年", "experiences": [ { "company": "北京华电能源互联网研究院有限公司", "position": "科研助理", "industry": "能源电力/科研", "period": "2023-072024-07", "responsibilities": [ "参与能源系统相关课题研究与技术方案论证", "协助撰写能源电力系统领域发明专利" ], "achievements": [ "协助完成发明专利4项（已提交/授权，以协作者身份）" ], "technologies": [ "综合能源系统建模思路", "专利撰写流程与技术交底" ] }, { "company": "WOOD中国宁夏分公司", "position": "热工助理工程师", "industry": "工程设计/能源", "period": "2025-072026-01", "responsibilities": [ "按业主要求开展能源系统方案设计与论证", "参与可行性研究与基础设计文件编制" ], "achievements": [ "完成可行性研究2项、基础设计2项并交付" ], "technologies": [ "能源系统方案设计方法", "可研/初设编制流程" ] } ], "career_summary": "路径由科研走向工程实践：研究院期间积累能源系统技术研究与专利协作能力，随后在工程公司完成从需求到可研/初设的工程化交付。期间并行发展数据/AI与爬虫能力，形成“工艺仿真+数据智能”的交叉能力结构。" }, "core_competencies": [ { "name": "工艺仿真与流程优化（Aspen Plus/AEA）", "level": "高级", "evidence": "在离子液体精馏工艺研究中提出两套方案并进行严格模拟，对能效/经济/环境进行对比评估；发表SCI论文2篇。" }, { "name": "综合能源系统方案设计与评估", "level": "中高级", "evidence": "园区多能互补运行优化研究，设计3种工作模式（含超临界CO2与电制天然气），授权发明专利1项；工程端完成2项可研与2项初设。" }, { "name": "Python数据分析与AI应用开发（RAG/Agent）", "level": "中高级", "evidence": "自研爬虫+AI+数据分析一体化智能体（岗位推荐、博导匹配、公众号要点汇总）；掌握langchain、RAG、Agent、numpy/pandas。" }, { "name": "爬虫与逆向工程", "level": "中级", "evidence": "掌握XPath、selenium与JS加密逆向，完成多源信息抓取以支撑智能体与分析任务。" }, { "name": "多目标技术经济-环境评估", "level": "中高级", "evidence": "在工艺研究中同时评估能效、经济性与环境影响，形成系统性对比分析结论。" }, { "name": "项目执行与工程交付", "level": "中级", "evidence": "在工程公司按业主要求完成可研与基础设计交付，具备从需求到文档产出的执行能力。" }, { "name": "专利与科研写作", "level": "中级", "evidence": "第一作者实用新型专利1项（已授权）、第二作者发明专利1项（已授权），并协助4项发明专利；SCI论文2篇。" }, { "name": "技术传播与影响力", "level": "中级", "evidence": "自媒体累计阅读42万+、互动9400+，具备将技术内容转化为受众可理解信息的能力。" }, { "name": "英语技术阅读/写作", "level": "中级", "evidence": "SCI论文发表与CET-6通过。" } ], "experience_analysis": { "valuable_experience": [ "将离子液体精馏新工艺进行严谨建模、仿真与多维度评价，体现从概念到可比选方案的端到端能力。", "园区综合能源系统（含超临界CO2与P2G）的运行策略设计与模式划分，体现系统级建模与优化思路，并产出发明专利。", "在工程公司完成可行性研究和基础设计，探索科研成果向工程交付的转化路径，理解业主需求与合规流程。", "自研爬虫+RAG智能体提升信息收集与知识组织效率，显示跨领域技术组合与快速原型能力。", "在研究院参与专利撰写与技术交底，形成知识产权意识与方法。" ], "transferable_skills": [ "复杂系统问题分解与建模能力（可迁移至多种流程工业与能源项目）", "多目标权衡与定量评估（能效/经济/环境），适用于技术选型与决策支持", "数据获取自动化与知识工程（爬虫+RAG），可迁移至信息密集型业务", "技术文档与专利写作，适用于方案呈现与知识沉淀", "从需求到交付的项目执行能力，适用于咨询、工程与产品实施场景", "跨学科协同与快速学习能力，适合新技术引入与迭代" ] }, "technical_business_profile": { "technical_capability": "强，侧重工艺仿真与综合能源系统设计，兼具Python数据分析、爬虫与RAG/Agent开发能力，擅长多目标技术经济评估。", "business_capability": "中等偏初，能够理解业主需求并转化为可研/初设交付，对成本、能效与合规性有基本把握，具备技术方案呈现与影响力传播能力。", "management_capability": "初级，适合作为小团队/课题核心骨干承担关键技术模块，当前更偏个人贡献者角色。" }, "career_preferences": { "preferred_work": [ "解决复杂问题与技术难题", "技术创新与跨领域探索", "高自由度的研究/开发与自主安排的工作节奏", "以数据与模型驱动的设计优化与决策支持", "从信息获取到方案输出的端到端任务" ], "preferred_environment": [ "小团队、高自由度的组织氛围", "多学科交叉、开放创新的环境", "注重技术深度与实质价值产出的文化" ], "preferred_role_style": [ "核心骨干型个人贡献者", "独立分析、深入思考后解决问题", "偏技术路线而非管理路线（当前阶段）" ] }, "career_motivation": { "main_drivers": [ "技术成长与持续学习", "创造与探索空间", "自主性与高自由度", "工作兴趣匹配", "发展空间", "工作生活平衡" ] }, "career_constraints": { "avoid_roles": [ "高频重复工作", "高压力竞争环境", "强销售性质岗位", "缺乏实际意义的工作" ], "avoid_environment": [ "强KPI与高压竞争文化", "以销售业绩为主导的团队", "流程繁复、个人自主性低的大型组织（相对不偏好）" ], "limitations": [ "总体工作年限约1.5年，完整项目全周期与大规模工程化实践仍需积累", "AI/数据产品的生产级工程化与落地经验有待进一步验证（目前以项目原型为主）", "工作地点偏好：信息不足，需要进一步确认（问卷第13题未提供有效地点信息）" ] }, "professional_profile_summary": "用户是具备综合能源系统与工艺仿真优势、并能将数据/AI方法（爬虫、RAG/Agent）应用于工程信息化与决策支持的交叉型工程人才。其竞争力在于将模型与数据结合，完成从信息获取、仿真分析到技术经济-环境多维评估的闭环；偏好小团队高自由度环境，愿作为核心骨干攻坚复杂技术问题。短板在于工程化规模与生产级AI落地经验尚需积累。适合的发展方向包括：工艺/能源系统仿真与优化工程师、综合能源系统设计与优化工程师、能源数字化/工业AI应用工程师、工艺数据科学家/工业软件应用工程师、碳管理/能效评估咨询等，这些方向兼顾其既有能力、创新偏好与长期成长潜力。" }'
-    # key ="sk-9913e2c88c09477fa5492318c4ba6768"
-    # url="https://api.deepseek.com"
-    # model="deepseek-v4-flash"
-    key = "sk-JrfN4hxZOKE4Zs7b6M5jYQnBsz0TsM7vGgtSyDXnIpav5Ptm"
-    url = "https://aigc789.top/v1"
-    model="gpt-5-nano-2025-08-07"
-    new_job_infos=scores_total(file_path, json_profile, key, url, model)
-    save_to_json(new_job_infos)
-
-
-if __name__ == "__main__":
-    train_tatol()
 
