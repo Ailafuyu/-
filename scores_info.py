@@ -316,7 +316,11 @@ def scores_total(uploaded_file, json_profile, key, url, model,log):
         with open(uploaded_file, "r", encoding="utf-8") as f:
             docs = json.load(f)
     else:
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
         docs = json.load(uploaded_file)
+    if not isinstance(docs, list) or not all(isinstance(item, dict) for item in docs):
+        raise ValueError("岗位文件必须是由 JSON 对象组成的数组。")
     tasks = [(index, job_info, key, url, model, json_profile) for index, job_info in enumerate(docs)]
     results = [None] * len(tasks)
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, max(1, len(tasks)))) as executor:
