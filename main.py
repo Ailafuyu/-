@@ -857,7 +857,7 @@ if submit:
 user_profile_string = False
 if submit_next:
     a2_str = ",".join(answer2)
-    a13_str = ",".join(answer3)
+    a13_str = ",".join(answer13)
     a14_str = ",".join(answer14)
     a15_str = ",".join(answer15)
     a16_str = answer16.strip() if answer16 else "无"
