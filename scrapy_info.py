@@ -174,7 +174,7 @@ def job_get(exe_path):
     user_query = "大模型"
 
     url = get_url(user_city, user_jobtype, user_salary, user_experience, user_degree, user_scale, user_query)
-    get_job_information(url, print, "")
+    return get_job_information(url, print, exe_path)
 
 if __name__ == "__main__":
-    job_get()
+    print("请在 Python 中调用 job_get(exe_path)，并传入本机 Chrome/Edge 可执行文件路径。")
