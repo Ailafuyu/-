@@ -11,10 +11,13 @@ def get_data(files):
         if isinstance(file, str):
             with open(file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                datas.extend(data)
         else:
+            if hasattr(file, "seek"):
+                file.seek(0)
             data = json.load(file)
-            datas.extend(data)
+        if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+            raise ValueError("每个岗位文件都必须是由 JSON 对象组成的数组。")
+        datas.extend(data)
     return datas
 
 def concat_files(files,hr_select):
@@ -52,8 +55,6 @@ def parse_salary(salary):
     nums = re.findall(r"\d+(?:\.\d+)?", salary)
 
     if len(nums) == 0:
-        return np.nan, np.nan
-    if len(nums) > 2:
         return np.nan, np.nan
     low = float(nums[0])
 
